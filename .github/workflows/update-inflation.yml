@@ -1,0 +1,41 @@
+name: Enflasyon verisini güncelle
+
+on:
+  schedule:
+    - cron: "23 5 * * *"     # her gün 05:23 UTC; veri değişmezse commit atılmaz
+  workflow_dispatch:          # Actions sekmesinden elle çalıştırma
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-inflation
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Veriyi indir ve doğrula
+        env:
+          # TÜFE'nin 2026 ve sonrası için gerekli. Settings → Secrets and variables → Actions →
+          # New repository secret: EVDS_KEY. (EVDS_SERIES isteğe bağlı; varsayılan TP.TUKFIY2025.GENEL)
+          EVDS_KEY: ${{ secrets.EVDS_KEY }}
+          EVDS_SERIES: ${{ vars.EVDS_SERIES }}
+        run: python3 scripts/update_inflation.py --output data/inflation.json
+      - name: Değiştiyse kaydet
+        run: |
+          if git diff --quiet -- data/inflation.json; then
+            echo "Değişiklik yok."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/inflation.json
+          git commit -m "Enflasyon verisi: $(date -u +%Y-%m-%d)"
+          git push

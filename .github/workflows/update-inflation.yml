@@ -27,6 +27,8 @@ jobs:
           # New repository secret: EVDS_KEY. (EVDS_SERIES isteğe bağlı; varsayılan TP.TUKFIY2025.GENEL)
           EVDS_KEY: ${{ secrets.EVDS_KEY }}
           EVDS_SERIES: ${{ vars.EVDS_SERIES }}
+          # TL mevduat faizi (isteğe bağlı; varsayılan TP.TRY.MT02 = 3 aya kadar vadeli)
+          EVDS_DEPOSIT_SERIES: ${{ vars.EVDS_DEPOSIT_SERIES }}
         run: python3 scripts/update_inflation.py --output data/inflation.json
       - name: Değiştiyse kaydet
         run: |

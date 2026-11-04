@@ -18,6 +18,12 @@ Baz yılı değişen seriler bağlanır: çakışan ay varsa o aydan, yoksa yeni
 eski serinin o yılki ortalamasına eşitlenerek. En fazla 2 aylık boşluk (ör. ABD Ekim 2025: kapanma
 nedeniyle yayımlanmadı) komşu ayların geometrik ortalamasıyla doldurulur ve dosyada işaretlenir.
 
+TRYDEP (TL mevduat): "Aynı parayı TL mevduatta tutsaydın" karşılaştırması için TCMB EVDS'teki TL mevduata
+uygulanan ağırlıklı ortalama faiz (akım, varsayılan 3 aya kadar vadeli: TP.TRY.MT02; EVDS_DEPOSIT_SERIES ile
+değiştirilebilir) aylık ortalama olarak indirilir ve stopaj düşülerek bir "mevduat servet endeksi"ne çevrilir:
+endeks[ay+1] = endeks[ay] × (1 + ((1 + yıllık faiz)^(1/12) − 1) × (1 − stopaj)). TCMB'nin oranları yıllık
+bileşiktir. Stopaj tablosu aşağıda (STOPAJ); oran değişince yeni satır eklenir (BAKIM.md).
+
 Güvenlik: Her seri ardışık ay, pozitif değer ve makul aylık değişim kontrolünden geçer.
 Kontrolü geçmeyen ya da mevcut dosyadakinden eski olan seri yazılmaz; mevcut veri korunur.
 """
@@ -263,14 +269,17 @@ EVDS_KEY = os.environ.get("EVDS_KEY")
 EVDS_SERIES = os.environ.get("EVDS_SERIES") or "TP.TUKFIY2025.GENEL"
 
 
-def fetch_evds():
-    """TÜFE (2025=100) TCMB EVDS'ten. Anahtar ve seri kodu gerekir."""
-    key, series = EVDS_KEY, EVDS_SERIES
+def fetch_evds(series=None, aggregation=None):
+    """TCMB EVDS'ten aylık seri (varsayılan TÜFE 2025=100). Anahtar gerekir.
+    `aggregation`: haftalık seriyi aya çevirirken ("avg" = aylık ortalama)."""
+    key, series = EVDS_KEY, series or EVDS_SERIES
     if not key or not series:
         raise RuntimeError("EVDS anahtarı verilmedi (EVDS_KEY ortam değişkeni)")
     end = dt.date.today().strftime("%d-%m-%Y")
     url = (f"https://evds3.tcmb.gov.tr/igmevdsms-dis/series={series}&startDate=01-01-{START_YEAR}"
            f"&endDate={end}&type=json&frequency=5")
+    if aggregation:
+        url += f"&aggregationTypes={aggregation}"
     try:
         data = json.loads(http(url, headers={"key": key}))
     except urllib.error.HTTPError as e:
@@ -285,6 +294,64 @@ def fetch_evds():
         year, mon = item["Tarih"].split("-")[:2]
         months[month_key(year, mon)] = float(item[field])
     return months
+
+
+# --------------------------------------------------------------------------- TL mevduat
+
+# TL mevduata uygulanan ağırlıklı ortalama faiz (akım, %, yıllık bileşik). 3 aya kadar vadeli: tasarruf
+# sahiplerinin en çok kullandığı vade aralığı (aylık yenilenen mevduat dahil).
+EVDS_DEPOSIT_SERIES = os.environ.get("EVDS_DEPOSIT_SERIES") or "TP.TRY.MT02"
+DEPOSIT_LABEL = "TCMB EVDS (TL mevduat, 3 aya kadar, stopaj sonrası)"
+
+# 6 aya kadar vadeli TL mevduat stopaj oranları: (geçerli olduğu ilk ay, oran). Ay içinde değişen oran o aydan
+# itibaren sayılır (yaklaşık). Kaynak: GVK geçici 67. madde ve Cumhurbaşkanı kararları.
+#   2013-01 … : %15 (olağan oran)          2020-10 (30.09.2020) … : %5 (geçici indirim, defalarca uzatıldı)
+#   2024-05 : %7,5    2024-11 : %10    2025-02 : %15    2025-07 (9.7.2025) : %17,5
+# 2018-2019'daki kısa süreli indirim tarihleri kaynaklarda net olmadığı için olağan oran sayıldı.
+# YENİ KARAR ÇIKINCA buraya satır ekle (BAKIM.md → "Stopaj değişti").
+STOPAJ = [
+    ("2005-01", 0.15),
+    ("2020-10", 0.05),
+    ("2024-05", 0.075),
+    ("2024-11", 0.10),
+    ("2025-02", 0.15),
+    ("2025-07", 0.175),
+]
+
+
+def stopaj(month):
+    rate = STOPAJ[0][1]
+    for start, value in STOPAJ:
+        if month >= start:
+            rate = value
+    return rate
+
+
+def next_month(key):
+    y, m = int(key[:4]), int(key[5:])
+    return month_key(y + (m == 12), 1 if m == 12 else m + 1)
+
+
+def deposit_index(rates, today=None):
+    """Aylık ortalama faizden (yıllık bileşik %) stopaj sonrası birikim endeksi.
+    Endeks ayın başındaki değerdir; içinde bulunulan (bitmemiş) ayın faizi işlenmez.
+    Boşluk varsa yalnız en son kesintisiz bölüm kullanılır."""
+    today = today or dt.date.today()
+    current = month_key(today.year, today.month)
+    months = sorted(m for m, r in rates.items() if r is not None and 0 < r < 200 and m < current)
+    if not months:
+        return {}
+    # En son kesintisiz bölüm
+    start = 0
+    for i in range(1, len(months)):
+        if next_month(months[i - 1]) != months[i]:
+            start = i
+    months = months[start:]
+    index = {months[0]: 100.0}
+    for m in months:
+        gross = (1 + rates[m] / 100) ** (1 / 12) - 1
+        index[next_month(m)] = index[m] * (1 + gross * (1 - stopaj(m)))
+    return index
 
 
 FALLBACKS = {
@@ -312,9 +379,12 @@ def main():
     parser.add_argument("--copy-to", action="append", default=[], help="aynı dosyanın kopyalanacağı ek yol")
     parser.add_argument("--evds-key", help="TCMB EVDS API anahtarı (ya da EVDS_KEY)")
     parser.add_argument("--evds-series", help="EVDS seri kodu (varsayılan TP.TUKFIY2025.GENEL)")
+    parser.add_argument("--evds-deposit-series", help="TL mevduat faizi seri kodu (varsayılan TP.TRY.MT02)")
     args = parser.parse_args()
     EVDS_KEY = args.evds_key or EVDS_KEY
     EVDS_SERIES = args.evds_series or EVDS_SERIES
+    global EVDS_DEPOSIT_SERIES
+    EVDS_DEPOSIT_SERIES = args.evds_deposit_series or EVDS_DEPOSIT_SERIES
 
     current = load(args.output)
     series = dict(current.get("series", {}))
@@ -344,6 +414,23 @@ def main():
             report.append("TRY: EVDS verisi OECD serisine bağlanamadı")
     except Exception as e:  # noqa: BLE001
         report.append(f"TRY: EVDS alınamadı: {e}")
+
+    # TL mevduat endeksi (karşılaştırma için; enflasyon serisi değildir, başarısız olursa betik durmaz)
+    try:
+        rates = fetch_evds(EVDS_DEPOSIT_SERIES, aggregation="avg")
+        index = deposit_index(rates)
+        if len(index) < 13:
+            raise RuntimeError(f"yeterli ay yok ({len(index)})")
+        changes = [index[b] / index[a] - 1 for a, b in zip(sorted(index), sorted(index)[1:])]
+        if not all(0 <= c < 0.10 for c in changes):
+            raise RuntimeError("aylık getiri makul aralıkta değil")
+        latest_rate = rates.get(max(m for m in rates if m < max(index)), None)
+        series["TRYDEP"] = {"source": DEPOSIT_LABEL,
+                            "months": {k: round(index[k], 6) for k in sorted(index)}}
+        report.append(f"TRYDEP: {DEPOSIT_LABEL} ✓ {min(index)} … {max(index)} "
+                      f"(son ay faizi %{latest_rate:.2f}, stopaj %{stopaj(max(index)) * 100:g})")
+    except Exception as e:  # noqa: BLE001
+        report.append(f"TRYDEP: mevduat faizi alınamadı, mevcut veri korundu: {e}")
 
     for code in CURRENCIES:
         existing = series.get(code)
@@ -387,7 +474,7 @@ def main():
             "version": 1,
             # Swift'in .iso8601 çözücüsü kesirli saniye kabul etmez.
             "generatedAt": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "series": {c: series[c] for c in CURRENCIES if c in series},
+            "series": {c: series[c] for c in [*CURRENCIES, "TRYDEP"] if c in series},
         }
         text = json.dumps(out, ensure_ascii=False, indent=1) + "\n"
         for path in [args.output, *args.copy_to]:
